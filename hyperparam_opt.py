@@ -1,0 +1,177 @@
+
+import pickle
+import argparse
+
+import numpy as np
+
+from keras.layers import Input, Dense, Activation, Dropout
+from keras.layers import BatchNormalization, Flatten, Conv1D, MaxPooling1D
+from keras.layers import concatenate
+from keras.models import Model
+from keras import regularizers
+from keras.initializers import glorot_normal
+from keras.optimizers import Adam
+
+
+def SPINet(num_classes, conv_shape, dense_shape,
+           lr=1e-3, reg=1e-2, dropout=0.1):
+
+    # convolution layer
+    conv_input = Input(shape=conv_shape, name='light_curve_input')
+    conv = Conv1D(filters=8,
+                  kernel_size=5,
+                  strides=1,
+                  padding='same',
+                  kernel_regularizer=regularizers.l2(reg),
+                  kernel_initializer=glorot_normal())(conv_input)
+    conv = BatchNormalization(axis=2)(conv)
+    conv = Activation('relu')(conv)
+    conv = MaxPooling1D(2)(conv)
+    conv = Conv1D(filters=16,
+                  kernel_size=5,
+                  strides=1,
+                  padding='same',
+                  kernel_regularizer=regularizers.l2(reg),
+                  kernel_initializer=glorot_normal())(conv_input)
+    conv = BatchNormalization(axis=2)(conv)
+    conv = Activation('relu')(conv)
+    conv = MaxPooling1D(2)(conv)
+    conv = Flatten()(conv)
+    conv = Dense(32, activation='relu')(conv)
+
+    # dense layer
+    dense_input = Input(shape=dense_shape, name='meta_data')
+    dense = Dense(4, activation='relu')(dense_input)
+    dense = BatchNormalization(axis=1)(dense)
+    dense = Dense(16, activation='relu')(dense_input)
+    dense = BatchNormalization(axis=1)(dense)
+    dense = Dense(64, activation='relu')(dense_input)
+    dense = BatchNormalization(axis=1)(dense)
+    dense = Dense(32, activation='relu')(dense)
+
+    # concatenate
+    x = concatenate([conv, dense])
+    x = Dense(64, activation='relu')(x)
+    x = Dropout(rate=dropout)(x)
+    x = Dense(128, activation='relu')(x)
+    x = Dropout(rate=dropout)(x)
+    x = Dense(256, activation='relu')(x)
+    x = Dropout(rate=dropout)(x)
+    x = Dense(num_classes,
+              kernel_regularizer=regularizers.l2(reg),
+              activation='sigmoid',
+              name='output')(x)
+
+    # optimizer
+    adam = Adam(lr=lr)
+
+    # create and compile model
+    model = Model(inputs=[conv_input, dense_input], outputs=x, name='SPINet')
+    model.compile(optimizer=adam , loss='categorical_crossentropy',
+                  metrics=['accuracy'])
+
+    return model
+
+def parse_command_line():
+    parser = argparse.ArgumentParser(description='hyperparam optimization')
+    parser.add_argument('-i', '--input',
+                        help    = 'input name',
+                        dest    = 'input',
+                        type    = str)
+    parser.add_argument('-o', '--output',
+                        help    = 'output name',
+                        default = None,
+                        dest    = 'output',
+                        type    = str)
+    parser.add_argument('-s', '--seed',
+                        help    = 'random seed',
+                        default = None,
+                        dest    = 'seed',
+                        type    = int)
+    parser.add_argument('-v', '--verbose',
+                        help    = 'print out message',
+                        default = False,
+                        dest    = 'verbose',
+                        action  = 'store_true')
+    params = parser.parse_args()
+    return params
+
+def main():
+
+    # parse cmd args
+    params = parse_command_line()
+
+    # read training data
+    with open(params.input, 'rb') as f:
+        data_dict = pickle.load(f)
+        X_conv = data_dict['X']
+        X_meta = data_dict['metaX']
+        y = data_dict['y']
+
+    # shuffle data
+    N = X_conv.shape[0]
+    np.random.seed(params.seed) # seed permutation
+    mask = np.random.permutation(N)
+    X_conv = X_conv[mask]
+    X_meta = X_meta[mask]
+    y = y[mask]
+
+    # divide into training and validation set
+    tfrac = int(0.8*N)
+    X_conv_train = X_conv[:tfrac]
+    X_conv_val = X_conv[tfrac:]
+    X_meta_train = X_meta[:tfrac]
+    X_meta_val = X_meta[tfrac:]
+    y_train = y[:tfrac]
+    y_val = y[tfrac:]
+
+    print('')
+    print('X_conv_train shape: {}'.format(X_conv_train.shape))
+    print('X_conv_val shape  : {}'.format(X_conv_val.shape))
+    print('X_meta_train shape: {}'.format(X_meta_train.shape))
+    print('X_meta_val shape  : {}'.format(X_meta_val.shape))
+    print('y_train shape     : {}'.format(y_train.shape))
+    print('y_val shape       : {}'.format(y_val.shape))
+
+    # hyperparameter optz
+    n_search = 2
+    n_epochs = 10
+    results = {}
+
+    # define search range
+    lrs = (1e-6, 1e-2)
+    regs = (0.001, 0.1)
+    dropouts = (0.1, 0.9)
+
+    print('')
+    print('begin hyperparam opt')
+    print('----------------------')
+    print('')
+    for i in range(n_search):
+        lr = np.exp(np.random.uniform(*np.log(lrs)))
+        ld = np.exp(np.random.uniform(*np.log(regs)))
+        dr = np.random.uniform(*dropouts)
+        print('- lr, reg, dr = %.4f, %.4f, %.4f' % (lr, ld, dr))
+
+        model = SPINet(num_classes = y_train.shape[1],
+                       conv_shape  = X_conv_train.shape[1:],
+                       dense_shape = X_meta_train.shape[1:],
+                       lr          = lr,
+                       reg         = ld,
+                       dropout     = dr)
+        res = model.fit(x               = [X_conv_train, X_meta_train],
+                        y               = y_train,
+                        epochs          = n_epochs,
+                        batch_size      = 32,
+                        validation_data = ([X_conv_val, X_meta_val], y_val),
+                        verbose         = params.verbose)
+        results[(lr, ld, dr)] = res.history
+
+    # save results
+    with open(params.output, 'wb') as f:
+        pickle.dump(results, f, protocol=-1)
+
+    print('')
+
+if __name__ == "__main__":
+    main()
